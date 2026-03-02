@@ -1,6 +1,7 @@
-.PHONY: build install clean test generate check-up-to-date
+.PHONY: build build-sgt install install-sgt clean test generate check-up-to-date
 
 BINARY := gt
+SGT_BINARY := sgt
 BUILD_DIR := .
 INSTALL_DIR := $(HOME)/.local/bin
 
@@ -19,6 +20,9 @@ generate:
 
 build: generate
 	go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY) ./cmd/gt
+
+build-sgt:
+	go build -o $(BUILD_DIR)/$(SGT_BINARY) ./cmd/sgt
 ifeq ($(shell uname),Darwin)
 	@codesign -s - -f $(BUILD_DIR)/$(BINARY) 2>/dev/null || true
 	@echo "Signed $(BINARY) for macOS"
@@ -51,8 +55,13 @@ install: check-up-to-date build
 	done
 	@echo "Installed $(BINARY) to $(INSTALL_DIR)/$(BINARY)"
 
+install-sgt: build-sgt
+	@mkdir -p $(INSTALL_DIR)
+	@cp $(BUILD_DIR)/$(SGT_BINARY) $(INSTALL_DIR)/$(SGT_BINARY)
+	@echo "Installed $(SGT_BINARY) to $(INSTALL_DIR)/$(SGT_BINARY)"
+
 clean:
-	rm -f $(BUILD_DIR)/$(BINARY)
+	rm -f $(BUILD_DIR)/$(BINARY) $(BUILD_DIR)/$(SGT_BINARY)
 
 test:
 	go test ./...
