@@ -1,36 +1,15 @@
 // Package sgt provides simplified agent management for simple-gt.
 //
-// There are two execution modes:
-//
-//   - Interactive: all agents share a single tmux session; each agent
-//     gets its own pane. The user can switch between panes normally.
-//
-//   - Background: each agent gets its own tmux session. Useful for
-//     headless / non-interactive workflows.
-//
+// All agents run as panes inside the shared orchestrator tmux session.
 // Agent state is persisted in .sgt/agents.json.
 package sgt
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"time"
-
-	"github.com/steveyegge/gastown/internal/tmux"
-)
-
-// Mode controls how an agent is hosted.
-type Mode string
-
-const (
-	// ModeInteractive puts the agent in a pane inside the shared orchestrator session.
-	ModeInteractive Mode = "interactive"
-
-	// ModeBackground gives the agent its own detached tmux session.
-	ModeBackground Mode = "background"
 )
 
 // Status of an agent.
@@ -41,14 +20,13 @@ const (
 	StatusStopped Status = "stopped"
 )
 
-// Agent represents a managed sub-agent.
+// Agent represents a managed sub-agent pane.
 type Agent struct {
 	Name      string    `json:"name"`
-	Mode      Mode      `json:"mode"`
-	Session   string    `json:"session"`   // tmux session name
-	Pane      string    `json:"pane"`      // tmux pane ID (interactive mode only)
-	Cmd       string    `json:"cmd"`       // command running in pane/session
-	WorkDir   string    `json:"work_dir"`  // working directory
+	Session   string    `json:"session"`  // tmux session name (orchestrator session)
+	Pane      string    `json:"pane"`     // tmux pane ID
+	Cmd       string    `json:"cmd"`      // command running in the pane
+	WorkDir   string    `json:"work_dir"` // working directory
 	Status    Status    `json:"status"`
 	StartedAt time.Time `json:"started_at"`
 }
@@ -56,7 +34,6 @@ type Agent struct {
 // Registry manages the set of known agents.
 type Registry struct {
 	sgtDir string
-	t      *tmux.Tmux
 }
 
 type registryFile struct {
@@ -65,10 +42,7 @@ type registryFile struct {
 
 // NewRegistry creates a Registry rooted at sgtDir.
 func NewRegistry(sgtDir string) *Registry {
-	return &Registry{
-		sgtDir: sgtDir,
-		t:      tmux.NewTmux(),
-	}
+	return &Registry{sgtDir: sgtDir}
 }
 
 func (r *Registry) filePath() string {
@@ -104,14 +78,9 @@ func (r *Registry) save(rf *registryFile) error {
 	return os.WriteFile(r.filePath(), data, 0o644)
 }
 
-// Spawn starts a new sub-agent.
-//
-// Interactive mode: creates a new pane in the named orchestrator session.
-// Background mode: creates a new detached tmux session named "sgt-<name>".
-//
-// cmd is the command to run (e.g. "claude --dangerously-skip-permissions").
-// workDir is the working directory; leave empty to inherit.
-func (r *Registry) Spawn(name string, mode Mode, sessionName, cmd, workDir string) (*Agent, error) {
+// Spawn creates a new pane in the orchestrator session and registers the agent.
+// cmd is the command to run; workDir is the working directory (empty = inherit).
+func (r *Registry) Spawn(name, sessionName, cmd, workDir string) (*Agent, error) {
 	rf, err := r.load()
 	if err != nil {
 		return nil, err
@@ -121,33 +90,19 @@ func (r *Registry) Spawn(name string, mode Mode, sessionName, cmd, workDir strin
 		return nil, fmt.Errorf("agent %q already exists", name)
 	}
 
+	paneID, err := spawnPane(sessionName, name, cmd, workDir)
+	if err != nil {
+		return nil, err
+	}
+
 	ag := &Agent{
 		Name:      name,
-		Mode:      mode,
+		Session:   sessionName,
+		Pane:      paneID,
 		Cmd:       cmd,
 		WorkDir:   workDir,
 		Status:    StatusRunning,
 		StartedAt: time.Now(),
-	}
-
-	switch mode {
-	case ModeInteractive:
-		paneID, err := r.spawnPane(sessionName, name, cmd, workDir)
-		if err != nil {
-			return nil, err
-		}
-		ag.Session = sessionName
-		ag.Pane = paneID
-
-	case ModeBackground:
-		sessName := "sgt-" + name
-		if err := r.t.NewSessionWithCommand(sessName, workDir, cmd); err != nil {
-			return nil, fmt.Errorf("spawn background agent %q: %w", name, err)
-		}
-		ag.Session = sessName
-
-	default:
-		return nil, fmt.Errorf("unknown mode %q", mode)
 	}
 
 	rf.Agents[name] = ag
@@ -157,9 +112,8 @@ func (r *Registry) Spawn(name string, mode Mode, sessionName, cmd, workDir strin
 	return ag, nil
 }
 
-// spawnPane adds a new named pane to an existing tmux session.
-func (r *Registry) spawnPane(session, name, cmd, workDir string) (string, error) {
-	// Split window to create new pane
+// spawnPane splits the window to add a new pane, returns the pane ID.
+func spawnPane(session, name, cmd, workDir string) (string, error) {
 	args := []string{"split-window", "-t", session, "-P", "-F", "#{pane_id}"}
 	if workDir != "" {
 		args = append(args, "-c", workDir)
@@ -175,14 +129,12 @@ func (r *Registry) spawnPane(session, name, cmd, workDir string) (string, error)
 		return "", fmt.Errorf("split-window in session %q: %w", session, err)
 	}
 
-	paneID := out
-	// Rename the pane title to the agent name
-	_, _ = runTmux("select-pane", "-t", paneID, "-T", name)
-
-	return paneID, nil
+	// Label the pane with the agent name
+	_, _ = runTmux("select-pane", "-t", out, "-T", name)
+	return out, nil
 }
 
-// Kill stops an agent and removes it from the registry.
+// Kill kills the agent's pane and removes it from the registry.
 func (r *Registry) Kill(name string) error {
 	rf, err := r.load()
 	if err != nil {
@@ -194,16 +146,8 @@ func (r *Registry) Kill(name string) error {
 		return fmt.Errorf("agent %q not found", name)
 	}
 
-	switch ag.Mode {
-	case ModeInteractive:
-		if ag.Pane != "" {
-			// Kill just this pane
-			_, _ = runTmux("kill-pane", "-t", ag.Pane)
-		}
-	case ModeBackground:
-		if err := r.t.KillSession(ag.Session); err != nil && !errors.Is(err, tmux.ErrSessionNotFound) {
-			return fmt.Errorf("kill session %q: %w", ag.Session, err)
-		}
+	if ag.Pane != "" {
+		_, _ = runTmux("kill-pane", "-t", ag.Pane)
 	}
 
 	delete(rf.Agents, name)
@@ -236,24 +180,15 @@ func (r *Registry) Get(name string) (*Agent, error) {
 	return ag, nil
 }
 
-// NudgeAgent sends a message to an agent's tmux pane/session.
-// Uses simple send-keys (text + Enter) without the AI-specific Escape handling
-// that NudgePane/NudgeSession add for vim/agent prompts.
+// NudgeAgent injects a message into the agent's pane (text + Enter).
 func (r *Registry) NudgeAgent(name, message string) error {
 	ag, err := r.Get(name)
 	if err != nil {
 		return err
 	}
-
-	target := ag.Session
-	if ag.Mode == ModeInteractive && ag.Pane != "" {
-		target = ag.Pane
-	}
-
-	// Send text literally, then Enter.  No Escape — that's for AI agent prompts.
-	if _, err := runTmux("send-keys", "-t", target, "-l", message); err != nil {
+	if _, err := runTmux("send-keys", "-t", ag.Pane, "-l", message); err != nil {
 		return fmt.Errorf("nudge send text: %w", err)
 	}
-	_, err = runTmux("send-keys", "-t", target, "Enter")
+	_, err = runTmux("send-keys", "-t", ag.Pane, "Enter")
 	return err
 }
