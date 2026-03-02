@@ -237,21 +237,23 @@ func (r *Registry) Get(name string) (*Agent, error) {
 }
 
 // NudgeAgent sends a message to an agent's tmux pane/session.
-// For interactive agents, it sends to the specific pane.
-// For background agents, it sends to the session.
+// Uses simple send-keys (text + Enter) without the AI-specific Escape handling
+// that NudgePane/NudgeSession add for vim/agent prompts.
 func (r *Registry) NudgeAgent(name, message string) error {
 	ag, err := r.Get(name)
 	if err != nil {
 		return err
 	}
-	switch ag.Mode {
-	case ModeInteractive:
-		if ag.Pane != "" {
-			return r.t.NudgePane(ag.Pane, message)
-		}
-		return r.t.NudgeSession(ag.Session, message)
-	case ModeBackground:
-		return r.t.NudgeSession(ag.Session, message)
+
+	target := ag.Session
+	if ag.Mode == ModeInteractive && ag.Pane != "" {
+		target = ag.Pane
 	}
-	return fmt.Errorf("unknown mode %q", ag.Mode)
+
+	// Send text literally, then Enter.  No Escape — that's for AI agent prompts.
+	if _, err := runTmux("send-keys", "-t", target, "-l", message); err != nil {
+		return fmt.Errorf("nudge send text: %w", err)
+	}
+	_, err = runTmux("send-keys", "-t", target, "Enter")
+	return err
 }
